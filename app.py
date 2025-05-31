@@ -480,13 +480,13 @@ def main():
     )
     # --- End Custom CSS ---
 
-    st.title("⚫️ 점자 번역기")
+    st.title("⚫️ 오목")
     st.markdown(
         """
         <p class='intro-text'>
-            손 끝에 새로운 정보를 담는 **실시간 점자(Braille) 번역기**입니다.<br>
-            센서에서 들어오는 실시간 8×10 점자 데이터를 <b>AI 모델</b>이 즉시 분류하고,<br>
-            인식된 한글 문자를 <b>음성으로 들려줍니다.</b>
+            손 끝에 정보를 담는 <b>실시간 점자 번역기</b>입니다.<br>
+            실시간 점자 데이터를 <b>AI 모델</b>이 즉시 분류하고,<br>
+            인식된 한글 문자를 <b>음성</b>으로 들려줍니다.
         </p>
         """,
         unsafe_allow_html=True

@@ -16,7 +16,7 @@ latest_prediction = None
 audio_bytes = None           
 
 model = None                 
-device = torch.device("cuda") 
+device = torch.device("cpu") 
 lock = threading.Lock()      
 
 # ------------------------------------------------

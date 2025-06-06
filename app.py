@@ -1,29 +1,28 @@
-# 1) 필요 모듈 임포트
 import streamlit as st
-import threading
-import socket
-import json
 import numpy as np
 import torch
 import torch.nn as nn
 from gtts import gTTS
 import tempfile
+import os
+from streamlit_autorefresh import st_autorefresh # pip install streamlit-autorefresh
+import serial
 import time
-import os # For deleting temp files
-from streamlit_autorefresh import st_autorefresh
 
-# --- Global Variables ---
-latest_grid = None
-latest_prediction = None
-audio_bytes = None
+from css import css_string
+from utils import KOREAN_BRAILLE_MAP
+from BrailleToKorean.BrailleToKor import BrailleToKor
 
-model = None
-device = torch.device("cpu") # Keep as CPU for broader compatibility
-lock = threading.Lock()
+import base64
+
+# --- PyTorch Model Device ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[DEBUG] Using device: {DEVICE}")
+
+TRANSLATOR = BrailleToKor()
 
 # ------------------------------------------------
-# 1. 브라유 인식용 PyTorch 네트워크 클래스 정의
-#    (모델 로드할 때 동일 클래스 필요)
+# 1. Braille Classification Model (Updated from Notebook)
 # ------------------------------------------------
 class BrailleCNN(nn.Module):
     def __init__(self):
@@ -34,619 +33,329 @@ class BrailleCNN(nn.Module):
         self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
         self.relu2 = nn.ReLU()
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        # Input (N, 1, 8, 10) -> conv1 (N, 32, 8, 10) -> pool1 (N, 32, 4, 5)
+        # 입력 (N, 1, 8, 10) -> conv1 (N, 32, 8, 10) -> pool1 (N, 32, 4, 5)
         # -> conv2 (N, 64, 4, 5) -> pool2 (N, 64, 2, 2) [5//2=2]
-        # Flattened features: 64 * 2 * 2 = 256
+        # 평탄화 후 특징 수: 64 * 2 * 2 = 256
         self.fc1 = nn.Linear(64 * 2 * 2, 128)
         self.relu3 = nn.ReLU()
         self.dropout = nn.Dropout(0.5)
-        self.fc2 = nn.Linear(128, 6) # 6 possible Braille dots for a single character
+        self.fc2 = nn.Linear(128, 6) # 6개 점자 예측
 
     def forward(self, x):
         out = self.pool1(self.relu1(self.conv1(x)))
         out = self.pool2(self.relu2(self.conv2(out)))
-        out = out.view(out.size(0), -1) # Flatten
+        out = out.view(out.size(0), -1) # 평탄화
         out = self.relu3(self.fc1(out))
         out = self.dropout(out)
         out = self.fc2(out)
         return out
 
 # ------------------------------------------------
-# 3. TCP 소켓 리스너 (백그라운드 쓰레드)
-#    - Arduino(ESP-01)가 보내는 JSON {"grid": [[...], ...]} 수신
+# Helper Functions
 # ------------------------------------------------
-def socket_listener(host='0.0.0.0', port=5001):
-    """
-    1) 서버 소켓 열어서 클라이언트 연결(Arduino) 대기
-    2) JSON payload를 모두 수신한 뒤, 파싱 → (8,10) 형태로 변환
-    3) torch.Tensor 형태 (1,1,8,10)로 reshape & 정규화(255.0) 후 latest_grid에 저장
-    """
-    global latest_grid
-
-    srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+# IMPORTANT: Ensure 'braille_cnn_model.pth' matches the BrailleCNN architecture defined above.
+# If using a model from the notebook saved as 'braille_recognition_model.pth',
+# ensure it was trained with the same architecture (16ch -> 32ch conv).
+def load_braille_model(model_path="braille_cnn_model.pth"): # Default path, consider changing if notebook model is primary
+    print(f"[DEBUG] Attempting to load model from: {model_path}")
     try:
-        srv_sock.bind((host, port))
-        srv_sock.listen(1)  # Allow only one Arduino(ESP-01) connection at a time
-    except OSError as e:
-        # st.error(f"Error binding socket: {e}. Port {port} might be in use or permissions issue.") # Can't use st.error in a non-Streamlit thread directly
-        print(f"Error binding socket: {e}. Port {port} might be in use or permissions issue.")
-        return # Exit the thread if binding fails
+        # Pass grid_rows and grid_cols if your BrailleCNN __init__ needs them
+        # For this example, assuming 8x10 fixed for fc layer calculation
+        model = BrailleCNN()
+        if not os.path.exists(model_path):
+            st.sidebar.error(f"⚠️ 모델 파일 '{model_path}'을 찾을 수 없습니다. 경로를 확인하거나 모델을 학습시켜주세요.")
+            print(f"[DEBUG] Model file not found: {model_path}")
+            return None
 
-    while True:
-        try:
-            conn, addr = srv_sock.accept()
-            data_bytes = b''
-            while True:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                data_bytes += chunk
-            conn.close()
+        model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+        model.to(DEVICE)
+        model.eval()
+        st.sidebar.success("✅ 모델이 성공적으로 로드되었습니다!")
+        print("[DEBUG] Model loaded successfully.")
+        return model
+    except FileNotFoundError:
+        st.sidebar.error(f"⚠️ '{model_path}' 파일을 찾을 수 없습니다. 모델 파일 위치를 확인하세요.")
+        print(f"[DEBUG] Model file not found (double check): {model_path}")
+        return None
+    except Exception as e:
+        st.sidebar.error(f"⚠️ 모델 로드 중 오류 발생: {e}")
+        print(f"[DEBUG] Error loading model: {e}")
+        return None
 
-            payload = json.loads(data_bytes.decode('utf-8'))
-            grid_list = payload.get("grid", None)
-            if grid_list is not None:
-                arr = np.array(grid_list, dtype=np.float32)  # (8,10) shape
-                if arr.shape == (8, 10):
-                    tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0) # PyTorch tensor: (1,1,8,10)
-                    tensor = tensor / 255.0 # Normalize: scale 0-255 to 0-1
-                    with lock:
-                        latest_grid = tensor.clone()
-        except Exception as e:
-            # Ignore JSON parsing errors, shape errors, connection errors, etc.
-            # print(f"Socket listener error: {e}") # For debugging
-            pass
+def map_6_dots_to_character(dot_pattern):
+    """Maps a 6-dot binary pattern (tuple) to a Korean character."""
+    # Ensure dot_pattern is a tuple for dictionary key lookup
+    if isinstance(dot_pattern, np.ndarray):
+        dot_pattern = tuple(dot_pattern.astype(int).tolist())
+    elif isinstance(dot_pattern, list):
+        dot_pattern = tuple(dot_pattern)
 
-        time.sleep(0.05)  # Prevent excessive CPU usage
+    char = KOREAN_BRAILLE_MAP.get(dot_pattern, "알 수 없음")
+    # print(f"[DEBUG] Mapping dot pattern {dot_pattern} to char '{char}'") # Can be verbose
+    return char
+
+
+def read_and_process_serial_data(serial_conn, min_sensor_val=0.0, max_sensor_val=1024.0, target_rows=10, target_cols=8):
+    grid_list_of_lists = []
+    total_values_expected = target_rows * target_cols
+    values_read = 0
+    
+    # print(f"[DEBUG] Attempting to read {target_rows}x{target_cols} grid ({total_values_expected} values).")
+
+    if not (serial_conn and serial_conn.is_open):
+        # print("[DEBUG] Serial connection not open in read_and_process_serial_data.")
+        return None
+
+    current_line_buffer = "" # Buffer for incomplete lines if any
+
+    for r in range(target_rows):
+        current_row = []
+        for c in range(target_cols):
+            value_found_for_cell = False
+            while not value_found_for_cell:
+                if serial_conn.in_waiting > 0:
+                    try:
+                        # Readline might block until newline or timeout
+                        line_bytes = serial_conn.readline()
+                        line = line_bytes.decode('utf-8', errors='ignore').strip()
+                        
+                        if line: # Ensure line is not empty
+                            value = int(line)
+                            print(f"[SENSOR RAW] ({r},{c}): {value}") # 원시 센서 값 로깅 (디버깅용)
+                            current_row.append(value)
+                            values_read += 1
+                            value_found_for_cell = True
+                            # print(f"[DEBUG] Read {value} for cell ({r},{c})")
+                            break # Move to next cell
+                        # else: empty line, loop again if within timeout
+                            # print(f"[DEBUG] Empty line at ({r},{c}), waiting...")
+                    except ValueError:
+                        print(f"[DEBUG] ValueError at ({r},{c}). Line: '{line}'")
+                        st.toast(f"⚠️ 데이터 형식 오류: '{line[:10]}...'", icon="❗")
+                        return None
+                    except Exception as e:
+                        st.toast(f"⚠️ 데이터 읽기 오류 ({r},{c}): {e}", icon="�")
+                        print(f"[DEBUG] Unexpected error reading serial data ({r},{c}): {e}")
+                        return None
+                else: # No data in waiting, sleep briefly before retrying within cell timeout
+                    time.sleep(0.01) # Small sleep to prevent busy-waiting
+            
+            if not value_found_for_cell:
+                print(f"[DEBUG] Timeout or no data for cell ({r},{c}) after attempts.")
+                st.toast(f"⚠️ 셀 ({r},{c}) 데이터 수신 시간 초과", icon="⏱️")
+                return None # Failed to get data for this cell
+
+        grid_list_of_lists.append(current_row)
+
+    if len(grid_list_of_lists) == target_rows and all(len(r) == target_cols for r in grid_list_of_lists):
+        print(f"[DEBUG] Successfully read {values_read}/{total_values_expected} values.")
+        input = np.array(grid_list_of_lists, dtype=np.float32)
+        input = np.clip(input, min_sensor_val, max_sensor_val)
+        
+        min_val = np.min(input)
+        max_val = np.max(input)
+        normalized_input = (input - min_val) / (max_val - min_val)
+        normalized_input = np.expand_dims(normalized_input, axis=0)
+        normalized_input = np.expand_dims(normalized_input, axis=0)
+
+        input_tensor = torch.from_numpy(normalized_input).float()
+
+        return input_tensor
+    else:
+        print(f"[DEBUG] Incomplete grid. Read {values_read}/{total_values_expected}. Structure: {len(grid_list_of_lists)} rows.")
+        return None
 
 # ------------------------------------------------
-# 4. 클래스 이름(인덱스 ↔ 한글 음절) 매핑 함수
-#    - 모델 학습 시 사용된 순서와 **완전히 동일하게** 유지해야 함
-# ------------------------------------------------
-@st.cache_resource
-def load_class_names():
-    # Example: Assumed 40 Korean Braille syllables were trained
-    # **NEVER CHANGE THE ORDER!**
-    return [
-        "가","나","다","라","마","바","사","아","자","차",
-        "카","타","파","하","거","너","더","러","머","버",
-        "서","어","저","처","커","터","퍼","허","고","노",
-        "도","로","모","보","소","오","조","초","코","토"
-    ]
-
-# ------------------------------------------------
-# 5. Streamlit 메인 함수
+# Streamlit main()
 # ------------------------------------------------
 def main():
-    global model, latest_grid, latest_prediction, audio_bytes
+    print("\n[DEBUG] --- Streamlit Script Rerun ---")
 
-    st.set_page_config(
-        page_title="점자 AI 번역기",
-        layout="wide",
-        initial_sidebar_state="auto" # 'auto' for mobile, collapses by default
-    )
+    if 'model' not in st.session_state:
+        st.session_state.model = None
+    if 'latest_grid' not in st.session_state:
+        st.session_state.latest_grid = None
+    if 'latest_predicted_dots' not in st.session_state: # Store the 6-dot pattern
+        st.session_state.latest_predicted_dots = None
+    if 'latest_prediction_char' not in st.session_state:
+        st.session_state.latest_prediction_char = None
+    if 'audio_bytes' not in st.session_state:
+        st.session_state.audio_bytes = None
+    if 'serial_connection' not in st.session_state:
+        st.session_state.serial_connection = None
+    if 'serial_is_running' not in st.session_state:
+        st.session_state.serial_is_running = False
+    if 'serial_port_input' not in st.session_state:
+        st.session_state.serial_port_input = 'COM9' # Default, adjust as needed
+    if 'serial_baud_rate_input' not in st.session_state:
+        st.session_state.serial_baud_rate_input = 9600
+    if 'auto_connect_attempted_this_session' not in st.session_state:
+        st.session_state.auto_connect_attempted_this_session = False
+    if 'current_tts_lang' not in st.session_state:
+        st.session_state.current_tts_lang = "ko"
+    if 'sentence' not in st.session_state:
+        st.session_state.sentence = ""
+    if 'translated_sentence' not in st.session_state:
+        st.session_state.translated_sentence = ""
+        
 
-    # --- Braille-Inspired, Modern & Sophisticated Custom CSS ---
-    st.markdown(
-        """
-        <style>
-            /* --- Global Styles --- */
-            html, body, [data-testid="stAppViewContainer"] {
-                font-family: 'AppleSDGothicNeo-Regular', 'Spoqa Han Sans Neo', 'Segoe UI', 'Malgun Gothic', sans-serif;
-                background: #f0f2f6; /* Soft, light background */
-                color: #2e3b4e; /* Dark text for high contrast */
-            }
+    st.set_page_config(page_title="O-MOK", layout="wide", initial_sidebar_state="auto")
 
-            /* --- Dot Pattern Background (for a Braille feel) --- */
-            body::before {
-                content: '';
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background-image: radial-gradient(circle at 10% 20%, rgba(204,204,204,0.1) 1px, transparent 1px),
-                                  radial-gradient(circle at 80% 90%, rgba(204,204,204,0.1) 1px, transparent 1px);
-                background-size: 20px 20px; /* Adjust dot spacing */
-                opacity: 0.7; /* Subtle opacity */
-                z-index: -1;
-            }
+    if not st.session_state.auto_connect_attempted_this_session and \
+       not st.session_state.serial_is_running:
+        print("[DEBUG] Attempting automatic serial connection on first load...")
+        port_to_try = st.session_state.serial_port_input
+        baud_to_try = st.session_state.serial_baud_rate_input
+        try:
+            if st.session_state.serial_connection and st.session_state.serial_connection.is_open:
+                st.session_state.serial_connection.close()
+            st.session_state.serial_connection = serial.Serial(port_to_try, baud_to_try, timeout=0.1) # Shorter timeout for connect
+            st.session_state.serial_is_running = True
+            st.toast(f"✅ 자동 연결 성공: {port_to_try}", icon="🔌")
+        except Exception as e:
+            print(f"[DEBUG] Auto-connect FAILED for {port_to_try}: {e}")
+            st.session_state.serial_connection = None
+            st.session_state.serial_is_running = False
+            st.toast(f"⚠️ 자동 연결 실패: {port_to_try}. ({e})", icon="🚫")
+        finally:
+            st.session_state.auto_connect_attempted_this_session = True
 
-            /* --- Sidebar Styles --- */
-            div[data-testid="stSidebar"] {
-                background: #ffffff;
-                padding-top: 25px;
-                box-shadow: 4px 0 15px rgba(0,0,0,0.08);
-                border-right: 1px solid #e5e5e5;
-            }
-            div[data-testid="stSidebar"] h2 {
-                color: #1a2a3a;
-                font-weight: 700;
-                margin-bottom: 20px;
-                padding-left: 20px;
-                font-size: 1.5rem;
-            }
-            div[data-testid="stSidebar"] h3 {
-                color: #4a6572;
-                font-weight: 600;
-                margin-top: 25px;
-                margin-bottom: 15px;
-                padding-left: 20px;
-                font-size: 1.15rem;
-            }
-            div[data-testid="stSidebar"] .stButton > button {
-                width: calc(100% - 40px);
-                margin: 0 20px;
-                border-radius: 10px; /* Slightly less rounded */
-                border: none;
-                color: white;
-                background: #3498db; /* A clear, friendly blue for action */
-                padding: 12px 0;
-                font-size: 1rem;
-                font-weight: 600;
-                box-shadow: 0 4px 10px rgba(52,152,219,0.3);
-                transition: all 0.3s ease-in-out;
-            }
-            div[data-testid="stSidebar"] .stButton > button:hover {
-                background: #2980b9;
-                box-shadow: 0 6px 12px rgba(52,152,219,0.4);
-                transform: translateY(-2px);
-            }
-            div[data-testid="stSidebar"] .stAlert {
-                margin: 20px;
-                border-radius: 10px;
-                font-size: 0.95rem;
-            }
-            div[data-testid="stSidebar"] .stSelectbox {
-                padding: 0 20px;
-                margin-top: 10px;
-                margin-bottom: 20px;
-            }
-            div[data-testid="stSidebar"] .stSelectbox label {
-                font-size: 1rem;
-                color: #5a5a5a;
-                margin-bottom: 8px;
-            }
+    st.markdown(css_string, unsafe_allow_html=True)
+    st.title("👁️‍🗨️ O-MOK")
+    st.markdown("<p class='intro-text'>손 끝에 정보를 담는 <b>실시간 점자 번역기</b>입니다.<br>실시간 점자 데이터를 <b>AI 모델</b>이 즉시 분류하고,<br>인식된 한글 문자를 <b>음성</b>으로 들려줍니다.</p>", unsafe_allow_html=True)
+    st.markdown("---")
 
-            /* --- Main Content Area --- */
-            .main .block-container {
-                padding-top: 3rem;
-                padding-right: 2.5rem;
-                padding-left: 2.5rem;
-                padding-bottom: 3rem;
-                max-width: 1200px;
-                margin: auto;
-            }
-
-            /* Title - Bold and impactful */
-            h1 {
-                color: #1a2a3a;
-                text-align: center;
-                font-size: 3.2rem;
-                margin-bottom: 0.75rem;
-                font-weight: 800;
-                letter-spacing: -1.5px;
-                text-shadow: 1px 1px 3px rgba(0,0,0,0.08);
-            }
-            /* Sub-headers for sections - Clear and concise */
-            h3 {
-                color: #4a6572;
-                font-size: 1.8rem;
-                margin-top: 2.5rem;
-                margin-bottom: 1.5rem;
-                font-weight: 700;
-                position: relative;
-                padding-bottom: 0.75rem;
-                text-align: center;
-            }
-            h3::after { /* Underline effect for sub-headers */
-                content: '';
-                position: absolute;
-                left: 50%;
-                bottom: 0;
-                transform: translateX(-50%);
-                width: 70px; /* Slightly wider */
-                height: 4px; /* Thicker */
-                background-color: #3498db; /* Accent color */
-                border-radius: 2px;
-            }
-
-            /* Introduction text */
-            .intro-text {
-                font-size: 1.1rem;
-                line-height: 1.6;
-                color: #5f6f7d;
-                text-align: center;
-                margin-bottom: 3rem;
-                max-width: 750px;
-                margin-left: auto;
-                margin-right: auto;
-            }
-            .intro-text strong {
-                color: #3498db; /* Accent color for emphasis */
-            }
-
-            /* Separator */
-            hr {
-                border: none;
-                border-top: 1px solid #e0e0e0;
-                margin: 3.5rem 0;
-            }
-
-            /* --- Content Cards/Containers --- */
-            div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"] {
-                background-color: #ffffff;
-                border-radius: 20px; /* More rounded */
-                box-shadow: 0 10px 30px rgba(0,0,0,0.12); /* Deeper, softer shadow */
-                padding: 2.5rem;
-                margin-bottom: 2.5rem;
-                transition: transform 0.3s ease-in-out, box-shadow 0.3s ease-in-out;
-            }
-            div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:hover {
-                transform: translateY(-7px); /* More pronounced lift */
-                box-shadow: 0 15px 40px rgba(0,0,0,0.18);
-            }
-
-            /* Grid Image - Enhanced Braille Dot Visualization */
-            div[data-testid="stImage"] {
-                display: flex;
-                flex-direction: column; /* To center caption below image */
-                align-items: center;
-                margin-top: 2rem;
-                margin-bottom: 2rem;
-            }
-            div[data-testid="stImage"] img {
-                border: 5px solid #aebac8; /* A sophisticated, cool gray border */
-                border-radius: 15px; /* More rounded image container */
-                box-shadow: 0px 10px 25px rgba(0,0,0,0.15); /* Soft shadow */
-                max-width: 100%;
-                height: auto;
-                object-fit: contain;
-                /* --- Custom Dot Visualization for Braille Grid (Advanced) --- */
-                /* This part is illustrative; direct pixel manipulation for "dots" isn't feasible with st.image
-                   but a custom component or creative use of HTML/SVG might achieve this */
-            }
-            div[data-testid="stImage"] .stImageCaption {
-                font-size: 0.95rem;
-                color: #6a7c8c;
-                text-align: center;
-                margin-top: 1rem;
-                font-style: italic;
-            }
-
-            /* Prediction Result - Bold and clear */
-            .prediction-container {
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                padding: 3rem 2.5rem;
-                background: #e0eaff; /* Soft, inviting blue background */
-                border-radius: 20px;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-                border: 1px solid #c0d9ff;
-                margin-top: 2rem;
-                position: relative;
-                overflow: hidden;
-            }
-            /* Subtle dot pattern inside prediction container */
-            .prediction-container::before {
-                content: '';
-                position: absolute;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background-image: radial-gradient(circle at 10% 20%, rgba(52,152,219,0.05) 1px, transparent 1px),
-                                  radial-gradient(circle at 80% 90%, rgba(52,152,219,0.05) 1px, transparent 1px);
-                background-size: 25px 25px;
-                z-index: 0;
-            }
-            .prediction-container h2 {
-                font-size: 5.5rem; /* Massive for impact */
-                color: #2980b9; /* Deep blue for the core result */
-                font-weight: 900; /* Extra bold */
-                margin-bottom: 0.75rem;
-                line-height: 1;
-                text-shadow: 3px 3px 8px rgba(0,0,0,0.15);
-                z-index: 1; /* Bring text above background pattern */
-            }
-            .prediction-container p {
-                font-size: 1.5rem;
-                color: #5f6f7d;
-                margin-bottom: 1.5rem;
-                font-weight: 500;
-                z-index: 1;
-            }
-
-            /* Audio Player */
-            audio {
-                width: 95%;
-                margin-top: 25px;
-                border-radius: 10px;
-                box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-                background-color: #fcfcfc;
-                z-index: 1;
-            }
-
-            /* Info/Warning Messages */
-            div[data-testid="stAlert"] {
-                border-radius: 12px;
-                margin-top: 1.8rem;
-                margin-bottom: 1.8rem;
-                padding: 1.2rem 1.8rem;
-                font-size: 1.05rem;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-            }
-            .st-emotion-cache-1f879j6 p {
-                font-size: 1.05rem !important;
-            }
-            .st-emotion-cache-1f879j6.stAlert-info {
-                background-color: #e6f7ff;
-                border-left: 6px solid #1890ff;
-                color: #1890ff;
-            }
-            .st-emotion-cache-1f879j6.stAlert-warning {
-                background-color: #fffbe6;
-                border-left: 6px solid #faad14;
-                color: #faad14;
-            }
-            .st-emotion-cache-1f879j6.stAlert-success {
-                background-color: #f6ffed;
-                border-left: 6px solid #52c41a;
-                color: #52c41a;
-            }
-
-            /* Spinner */
-            .stSpinner > div > div {
-                color: #3498db; /* Accent blue for spinner */
-            }
-
-            /* Streamlit defaults override for cleaner spacing */
-            .st-emotion-cache-h5rgjs { /* block-container after first h1 */
-                padding-top: 0;
-            }
-            .st-emotion-cache-1hm31g7 { /* stcolumns wrapper */
-                gap: 3rem; /* More space between columns on desktop */
-            }
-
-            /* --- Mobile Specific Adjustments --- */
-            @media (max-width: 768px) {
-                h1 {
-                    font-size: 2.5rem;
-                }
-                h3 {
-                    font-size: 1.5rem;
-                    margin-top: 1.8rem;
-                    margin-bottom: 1rem;
-                }
-                .main .block-container {
-                    padding-top: 1.5rem;
-                    padding-right: 0.8rem;
-                    padding-left: 0.8rem;
-                    padding-bottom: 1.5rem;
-                }
-                .intro-text {
-                    font-size: 1rem;
-                    margin-bottom: 2rem;
-                }
-                hr {
-                    margin: 2.5rem 0;
-                }
-                div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"] {
-                    margin-bottom: 1.5rem;
-                    padding: 1.5rem;
-                    border-radius: 15px; /* Slightly less rounded for small screens */
-                    box-shadow: 0 6px 20px rgba(0,0,0,0.1);
-                }
-                div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:hover {
-                    transform: translateY(-5px);
-                    box-shadow: 0 10px 30px rgba(0,0,0,0.15);
-                }
-                .prediction-container {
-                    padding: 2.5rem 1.5rem;
-                    border-radius: 15px;
-                }
-                .prediction-container h2 {
-                    font-size: 4rem; /* Smaller for mobile */
-                }
-                .prediction-container p {
-                    font-size: 1.2rem;
-                }
-                audio {
-                    width: 100%;
-                }
-                div[data-testid="stSidebar"] {
-                    padding-top: 15px;
-                }
-                div[data-testid="stSidebar"] .stButton > button {
-                    width: calc(100% - 30px);
-                    margin: 0 15px;
-                    padding: 10px 0;
-                    font-size: 0.95rem;
-                    border-radius: 8px;
-                }
-                div[data-testid="stSidebar"] .stAlert {
-                    margin: 15px;
-                }
-                body::before { /* Smaller dots for mobile background */
-                    background-size: 15px 15px;
-                }
-            }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-    # --- End Custom CSS ---
-
-    st.title("⚫️ 오목")
-    st.markdown(
-        """
-        <p class='intro-text'>
-            손 끝에 정보를 담는 <b>실시간 점자 번역기</b>입니다.<br>
-            실시간 점자 데이터를 <b>AI 모델</b>이 즉시 분류하고,<br>
-            인식된 한글 문자를 <b>음성</b>으로 들려줍니다.
-        </p>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.markdown("---") # Visual separator
-
-    # --- Sidebar Configuration ---
     st.sidebar.header("⚙️ 앱 설정")
-    st.sidebar.markdown("여기서 모델 관리 및 음성 합성 설정을 변경할 수 있습니다.")
+    st.sidebar.markdown("### 🔌 시리얼 연결")
+    current_port = st.session_state.serial_port_input
+    current_baud = st.session_state.serial_baud_rate_input
+    st.session_state.serial_port_input = st.sidebar.text_input("시리얼 포트", value=current_port)
+    st.session_state.serial_baud_rate_input = st.sidebar.selectbox("보드 레이트", options=[9600, 115200, 57600, 38400], index=([9600, 115200, 57600, 38400].index(current_baud) if current_baud in [9600, 115200, 57600, 38400] else 0))
 
-    # Model Load/Reload Section
+    col_connect, col_disconnect = st.sidebar.columns(2)
+    if col_connect.button("연결 시작", disabled=st.session_state.serial_is_running, use_container_width=True):
+        if st.session_state.serial_connection and st.session_state.serial_connection.is_open:
+            st.session_state.serial_connection.close()
+        try:
+            st.session_state.serial_connection = serial.Serial(st.session_state.serial_port_input, st.session_state.serial_baud_rate_input, timeout=0.1) # Shorter timeout
+            st.session_state.serial_is_running = True
+            st.sidebar.success(f"✅ {st.session_state.serial_port_input}에 연결됨.")
+            st.session_state.latest_grid = None; st.session_state.latest_prediction_char = None; st.session_state.audio_bytes = None
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"⚠️ 연결 실패: {e}")
+            st.session_state.serial_connection = None; st.session_state.serial_is_running = False
+
+    if col_disconnect.button("연결 중지", disabled=not st.session_state.serial_is_running, use_container_width=True):
+        st.session_state.serial_is_running = False
+        if st.session_state.serial_connection and st.session_state.serial_connection.is_open:
+            st.session_state.serial_connection.close()
+            st.sidebar.info("🔌 연결이 중지되었습니다.")
+        st.rerun()
+
     st.sidebar.markdown("### 🧠 모델 관리")
-    if st.sidebar.button("모델 재로드"):
-        with st.spinner("모델을 다시 로드 중..."): # Spinner appears in main area
-            model = BrailleCNN()
-            try:
-                model.load_state_dict(torch.load("braille_cnn_model.pth", map_location=device))
-                model.to(device)
-                model.eval()
-                st.sidebar.success("모델이 성공적으로 재로드되었습니다!")
-            except FileNotFoundError:
-                st.sidebar.error("⚠️ 'braille_cnn_model.pth' 파일을 찾을 수 없습니다. 모델 파일이 올바른 위치에 있는지 확인하세요.")
-            except Exception as e:
-                st.sidebar.error(f"⚠️ 모델 로드 중 오류 발생: {e}")
+    # Ensure model path matches your actual model file, possibly 'braille_recognition_model.pth' from notebook
+    model_file_to_load = "braille_cnn_model.pth" # Or "braille_recognition_model.pth"
+    if st.sidebar.button("모델 (재)로드"):
+        with st.spinner("모델을 다시 로드 중..."):
+            st.session_state.model = load_braille_model(model_file_to_load)
+    if st.session_state.model is None:
+        with st.spinner("초기 모델 로드 중..."):
+            st.session_state.model = load_braille_model(model_file_to_load)
 
-    if model is None:
-        with st.spinner("초기 모델 로드 중..."): # Spinner appears in main area
-            model = BrailleCNN()
-            try:
-                model.load_state_dict(torch.load("braille_cnn_model.pth", map_location=device))
-                model.to(device)
-                model.eval()
-                st.sidebar.success("모델이 성공적으로 로드되었습니다!")
-            except FileNotFoundError:
-                st.sidebar.error("⚠️ 'braille_cnn_model.pth' 파일을 찾을 수 없습니다. 모델 파일이 올바른 위치에 있는지 확인하세요.")
-            except Exception as e:
-                st.sidebar.error(f"⚠️ 모델 로드 중 오류 발생: {e}")
-
-
-    # TTS Language Selection Section
     st.sidebar.markdown("### 🔊 음성 합성 설정")
-    tts_lang_option = st.sidebar.selectbox(
-        "TTS 언어 선택",
-        options=[("한국어 (ko)", "ko"), ("영어 (en)", "en"), ("일본어 (ja)", "ja")],
-        format_func=lambda x: x[0], # Display only the name in the selectbox
-        index=0,
-        help="예측된 한글 문자를 읽어줄 언어를 선택하세요."
-    )
-    tts_lang = tts_lang_option[1] # Get the language code
-
+    tts_lang_options_map = {"한국어 (ko)": "ko", "영어 (en)": "en", "일본어 (ja)": "ja"}
+    selected_tts_lang_display = st.sidebar.selectbox("TTS 언어 선택", options=list(tts_lang_options_map.keys()), index=list(tts_lang_options_map.values()).index(st.session_state.current_tts_lang))
+    st.session_state.current_tts_lang = tts_lang_options_map[selected_tts_lang_display]
     st.sidebar.markdown("---")
-    st.sidebar.info("💡 이 앱은 Arduino(ESP-01)로부터 TCP 통신을 통해 점자 데이터를 수신합니다. 포트: 5001")
 
-    # --- Auto Refresh (0.5 seconds interval) ---
-    st_autorefresh(interval=500, limit=None, key="auto_refresh_braille")
+    st_autorefresh(interval=10000, limit=None, key="auto_refresh_braille_serial") # Slightly longer interval
 
-    # ===== Main Content Layout: Two Columns (will stack on mobile) =====
-    col1, col2 = st.columns([1, 1])
+    if st.session_state.serial_is_running and st.session_state.serial_connection:
+        # Heuristic: check if there's roughly enough data for a full grid
+        # (80 values * ~2 bytes/value for "0\n" or "1\n")
+        MIN_BYTES_FOR_GRID = 6 * 80 # Minimum if just '0' or '1' without newline, adjust as needed
+        print(f"[DEBUG] in_waiting = {st.session_state.serial_connection.in_waiting}")
+        if st.session_state.serial_connection.in_waiting >= MIN_BYTES_FOR_GRID:
+            print(f"[DEBUG] Buffer: {st.session_state.serial_connection.in_waiting} bytes. Attempting grid read.")
+            # This read_and_process_serial_data will now try to read 80 individual lines
+            new_grid_tensor = read_and_process_serial_data(st.session_state.serial_connection, target_rows=10, target_cols=8)
+            print(f"[DEBUG] Returned tensor shape: {new_grid_tensor.shape}")
+            print(f"[DEBUG] Type of new_grid_tensor: {type(new_grid_tensor)}, device: {new_grid_tensor.device}")
+            st.session_state.latest_grid = new_grid_tensor
+            print(f"[DEBUG] Update latest_grid")
 
-    with col1:
-        st.markdown("### 1) 실시간 데이터")
-        # Placeholder for the grid image
-        grid_placeholder = st.empty()
-        st.markdown(
-            "<p style='text-align: center; color: #777; font-size: 0.9rem;'>8×10 센서 배열에서 읽어들인 점자 패턴입니다.</p>",
-            unsafe_allow_html=True
-        )
-
-    with col2:
-        st.markdown("### 2) 번역 결과")
-        # Placeholder for the prediction result
-        prediction_placeholder = st.empty()
-        st.markdown(
-            "<p style='text-align: center; color: #777; font-size: 0.9rem;'>AI 모델이 인식한 한글 문자와 음성 출력입니다.</p>",
-            unsafe_allow_html=True
-        )
-
-    # ===== Model Inference & UI Update (runs on each refresh) =====
-    tensor = None
-    with lock:
-        if latest_grid is not None:
-            tensor = latest_grid.clone()
-
-    if tensor is not None:
-        # (1) 8x10 Image Reconstruction
-        arr_8x10 = (tensor.squeeze(0).squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-
-        # Update grid image in its placeholder
-        with grid_placeholder.container():
-            st.image(
-                arr_8x10,
-                caption="실시간 데이터",
-                width=300, # Fixed width, responsive via CSS max-width
-                use_column_width=False,
-                clamp=True,
-            )
-
-        # (2) Model Inference
-        if model is not None:
             with torch.no_grad():
-                input_tensor = tensor.to(device)
-                outputs = model(input_tensor)
-                _, pred_idx = torch.max(outputs, dim=1)
-                class_idx = pred_idx.item()
+                input_for_model = st.session_state.latest_grid.to(DEVICE)
+                print(f"[DEBUG] 모델 추론 시작: {input_for_model.shape}")
+                model_outputs = st.session_state.model(input_for_model)
+                # --- Output processing for multi-label (6-dot) ---
+                predicted_labels = (torch.sigmoid(model_outputs) > 0.5).int().cpu().numpy().flatten().tolist()
+                print(f"[DEBUG] 모델 추론 결과: {predicted_labels}")
+                
+                st.session_state.sentence += KOREAN_BRAILLE_MAP.get(str(predicted_labels))
+                print(f"[DEBUG] RAW BRAILLE: '{st.session_state.sentence}'")
+                st.session_state.translated_sentence = TRANSLATOR.translation(st.session_state.sentence)
+                print(f"[DEBUG] 번역 결과: '{st.session_state.translated_sentence}'")
 
-            class_names = load_class_names()
-            predicted_char = class_names[class_idx] if 0 <= class_idx < len(class_names) else "알 수 없음"
+                if st.session_state.translated_sentence:
+                    tts = gTTS(text="번역 결과는 다음과 같습니다. " + st.session_state.translated_sentence, lang="ko")
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+                        tts.save(tmp.name)
+                        tmp_path = tmp.name
+                    
+                    with open(tmp_path, "rb") as f:
+                        st.session_state.audio_bytes = f.read()
+                        print(f"[DEBUG] audio_bytes length = {len(st.session_state.audio_bytes)} bytes")
+                    os.unlink(tmp_path)
 
-            # (3) Generate TTS only if it's a new prediction
-            if predicted_char != latest_prediction:
-                latest_prediction = predicted_char
-                if predicted_char != "알 수 없음":
-                    try:
-                        tts = gTTS(text=predicted_char, lang=tts_lang)
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_audio_file:
-                            tts.save(tmp_audio_file.name)
-                            tmp_path = tmp_audio_file.name
-                        with open(tmp_path, "rb") as f:
-                            audio_bytes = f.read()
-                        os.unlink(tmp_path) # Clean up temp file
-                    except Exception as e:
-                        audio_bytes = None
-                        # print(f"TTS generation error: {e}") # For debugging
-                else:
-                    audio_bytes = None # No audio for "Unknown"
+                    b64 = base64.b64encode(st.session_state.audio_bytes).decode("utf-8")
 
-            # Update prediction result in its placeholder
-            with prediction_placeholder.container():
-                st.markdown("<div class='prediction-container'>", unsafe_allow_html=True)
-                st.markdown(f"<h2>{predicted_char}</h2>", unsafe_allow_html=True)
-                st.markdown("<p>번역 결과</p>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-                if audio_bytes:
-                    st.audio(audio_bytes, format="audio/mp3", help="예측된 문자의 음성 출력입니다.")
-                elif predicted_char == "알 수 없음":
-                    st.warning("모델이 점자를 정확히 인식하지 못했습니다. 더 많은 데이터가 필요할 수 있습니다.")
-                else:
-                    st.info("음성 파일을 생성 중입니다...")
-        else:
-            with prediction_placeholder.container():
-                st.warning("모델이 로드되지 않았습니다. 사이드바에서 모델을 로드해주세요.")
+                    # (C) HTML <audio> 태그 작성
+                    audio_html = f"""
+                    <audio controls autoplay preload="auto">
+                    <source src="data:audio/mp3;base64,{b64}" type="audio/mp3" />
+                    Your browser does not support the audio element.
+                    </audio>
+                    """
 
-    else:
-        # Initial state or no data received
+                    # (D) Streamlit에 렌더
+                    st.markdown(audio_html, unsafe_allow_html=True)
+                    # Prediction logic moved down to ensure it runs after potential grid update
+            # else:
+                # print("[DEBUG] read_and_process_serial_data returned None.")
+        # else:
+            # print(f"[DEBUG] Buffer low: {st.session_state.serial_connection.in_waiting} bytes. Waiting.")
+            # pass # Wait for more data
+
+    elif st.session_state.serial_is_running and not st.session_state.serial_connection:
+        st.sidebar.warning("⚠️ 연결 상태 오류. 재연결 필요.")
+        st.session_state.serial_is_running = False
+
+    col_display1, col_display2 = st.columns([1, 1])
+    with col_display1:
+        st.markdown("### 1) 실시간 데이터")
+        grid_placeholder = st.empty()
+        st.markdown("<p style='text-align: center; color: #777;'>10×8 센서 배열</p>", unsafe_allow_html=True)
+    with col_display2:
+        st.markdown("### 2) 번역 결과")
+        prediction_placeholder = st.empty()
+        st.markdown("<p style='text-align: center; color: #777;'>AI 인식 결과</p>", unsafe_allow_html=True)
+
+    if st.session_state.latest_grid is not None:
         with grid_placeholder.container():
-            st.info("🔄 Arduino(ESP-01)로부터 데이터 수신 대기 중입니다. 잠시만 기다려주세요.")
-        with prediction_placeholder.container():
-            st.info("예측 결과가 여기에 표시될 예정입니다. 센서 데이터를 기다리고 있습니다.")
+            arr_display = (st.session_state.latest_grid.squeeze().cpu().numpy() * 255).astype(np.uint8)
+            st.image(arr_display, caption="실시간 데이터 (10x8)", width=300, use_container_width='auto', clamp=True)
 
+        if st.session_state.model is not None:
+            with prediction_placeholder.container():
+                st.markdown(f"<div class='prediction-container'><h2>{st.session_state.translated_sentence if st.session_state.translated_sentence else '...'}</h2><p>번역 결과</p></div>", unsafe_allow_html=True)
+        else:
+            with prediction_placeholder.container(): st.warning("⚠️ 모델 로드 안됨.")
+    else:
+        with grid_placeholder.container():
+            st.info("🔌 시리얼 연결 시작 또는 데이터 수신 대기 중..." if st.session_state.serial_is_running else "🔌 시리얼 연결을 시작해주세요.")
+        with prediction_placeholder.container(): st.info("👀 결과 대기 중...")
 
-# ------------------------------------------------
-# 6. 백그라운드 스레드 실행 & Streamlit 앱 시작
-# ------------------------------------------------
 if __name__ == "__main__":
-    # Ensure the socket listener only starts once
-    if "listener_started" not in st.session_state:
-        listener_thread = threading.Thread(target=socket_listener, daemon=True)
-        listener_thread.start()
-        st.session_state.listener_started = True
-
-    # Streamlit app execution
     main()
